@@ -8,8 +8,7 @@
 
 ## 为什么需要它？
 
-Figma 使用 AWS CloudFront 等 CDN 分发资源，不同地区的 CDN 节点延迟差异巨大。旧版方案（修改 hosts 文件）将域名固定绑定到一个 IP，当该 IP 拥堵时毫无办法。
-
+Figma 使用 AWS CloudFront 等 CDN 分发资源，不同地区的 CDN 节点延迟差异巨大。
 **FigaDNS** 的方案：
 
 - 本地运行一个轻量 DNS 服务器
