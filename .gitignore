@@ -24,3 +24,7 @@ figadns-amd64
 
 # Temp
 /tmp/
+
+# Project icons
+!*.ico
+!*.icns
