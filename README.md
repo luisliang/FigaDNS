@@ -2,7 +2,7 @@
 
 **Figma 智能 DNS 加速工具** — 自动检测 Figma 各 CDN 节点的网络拥堵，动态切换最优线路。
 
-由 [Merlin Studio](https://github.com/MerlinStudio) 出品，替代传统 hosts 静态绑定方案。
+由 [Merlin Studio CN] 出品，替代传统 hosts 静态绑定方案。
 
 ---
 
