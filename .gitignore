@@ -1,0 +1,26 @@
+# Go
+/bin/
+/pkg/
+*.exe
+*.test
+*.out
+figadns
+figadns-arm64
+figadns-amd64
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+
+# Build artifacts
+../FigaDNS.app/
+
+# Temp
+/tmp/
