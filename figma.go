@@ -3,10 +3,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // FigmaDomain 一个 Figma 域名及其子域名
@@ -17,6 +19,14 @@ type FigmaDomain struct {
 }
 
 // Figma 相关域名
+// 依据 Figma 官方网络策略（Help Center: Adjust your network settings）
+//   *.figma.com             主站 / API / 静态资源
+//   *.figma.site            原型预览 / 嵌入 / Make Proxy
+//   *.makeproxy-c.figma.site  实时协作代理（C 线路）— 独立 root，IP 池与 figma.site 不同
+//   *.makeproxy-m.figma.site  实时协作代理（M 线路）— 独立 root
+// 不纳入：
+//   figma.app — 桌面应用标识，无公网 A 记录（8.8.8.8 验证为 SERVFAIL）
+//   awswaf.com / esm.sh / jsdelivr.net — 第三方公共 CDN，与 Figma 不共享 IP 池
 var FigmaDomains = []FigmaDomain{
 	{
 		Domain: "figma.com",
@@ -31,49 +41,68 @@ var FigmaDomains = []FigmaDomain{
 			"images.figma.com",
 		},
 	},
+	{
+		Domain: "figma.site",
+		Label:  "Figma 原型/嵌入",
+		Subs: []string{
+			"figma.site",
+		},
+	},
+	{
+		// Make Proxy 是 Figma 实时协作代理，独立 IP 池，必须单独 root
+		// 不能归到 figma.site，否则会污染 figma.site 的路由表
+		Domain: "makeproxy-c.figma.site",
+		Label:  "Figma 协作代理 C",
+		Subs: []string{
+			"makeproxy-c.figma.site",
+		},
+	},
+	{
+		Domain: "makeproxy-m.figma.site",
+		Label:  "Figma 协作代理 M",
+		Subs: []string{
+			"makeproxy-m.figma.site",
+		},
+	},
 }
 
-// 已知 Figma IP 兜底列表 (从 FigmaNetOK 及其他来源汇总)
-// 这些是 Figma/CDN 常用的 IP 段
+// 已知 Figma IP 兜底列表（真实可达的 CloudFront 边缘节点 IP，非网段号）
+// 用于 DNS 解析失败时的兜底，避免候选 IP 列表为空
 var knownFigmaIPs = map[string][]string{
 	"figma.com": {
-		// Fastly CDN 常见节点
-		"151.101.1.0", "151.101.65.0", "151.101.129.0", "151.101.193.0",
-		"151.101.2.0", "151.101.66.0", "151.101.130.0", "151.101.194.0",
-		// AWS CloudFront 节点
-		"13.32.0.0", "13.224.0.0", "13.249.0.0",
-		"52.84.0.0", "52.222.0.0", "54.182.0.0",
-		"54.192.0.0", "54.230.0.0", "54.239.0.0",
-		"204.246.0.0",
-		// 亚洲节点
-		"13.113.0.0", "13.115.0.0", "13.230.0.0",
-		"18.176.0.0", "18.180.0.0", "18.183.0.0",
-		"52.68.0.0", "52.78.0.0", "52.192.0.0",
-		"52.194.0.0", "52.196.0.0", "52.198.0.0",
-		"54.64.0.0", "54.65.0.0", "54.92.0.0",
-		"54.150.0.0", "54.168.0.0", "54.199.0.0",
-		"54.238.0.0", "54.250.0.0",
-		// 日本节点
-		"13.112.0.0", "13.113.0.0", "13.114.0.0",
-		"13.115.0.0", "13.230.0.0", "13.231.0.0",
-		"18.176.0.0", "18.177.0.0", "18.178.0.0",
-		"18.179.0.0", "18.180.0.0", "18.181.0.0",
-		"18.182.0.0", "18.183.0.0",
+		"13.224.0.132",
+		"13.224.0.171",
+		"13.224.0.245",
+		"108.156.210.132",
+		"108.156.210.171",
+	},
+	"figma.site": {
+		"13.224.0.132",
+		"13.224.0.171",
+		"108.156.210.132",
 	},
 }
 
 // IPDiscoverer IP 发现器
 type IPDiscoverer struct {
-	mu          sync.RWMutex
-	discovered  map[string][]string // domain → IPs (从 DNS 解析出来的)
-	resolver    *net.Resolver
-	knownOnly   bool
+	mu         sync.RWMutex
+	discovered map[string][]string // domain → IPs (从 DNS 解析出来的)
+	resolver   *net.Resolver
+}
+
+// chinaDNS 用于 IP 发现的可靠 DNS（阿里公共 DNS，国内外均可达）
+var chinaDNS = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialer := net.Dialer{Timeout: 5 * time.Second}
+		return dialer.DialContext(ctx, "udp", "223.5.5.5:53")
+	},
 }
 
 func NewIPDiscoverer() *IPDiscoverer {
 	return &IPDiscoverer{
 		discovered: make(map[string][]string),
-		resolver:   net.DefaultResolver,
+		resolver:   chinaDNS,
 	}
 }
 
@@ -139,10 +168,6 @@ func (d *IPDiscoverer) GetAllIPs(domain string) []string {
 		return disc
 	}
 
-	if d.knownOnly {
-		return fallback
-	}
-
 	// 去重合并
 	seen := make(map[string]bool)
 	var combined []string
@@ -161,33 +186,6 @@ func (d *IPDiscoverer) GetAllIPs(domain string) []string {
 	return combined
 }
 
-// ResolveFigmaIPs 从 Figma 域名的 DNS 响应中解析 IP
-// 用于被动模式：从真实 DNS 查询中提取 IP
-func (d *IPDiscoverer) ResolveFigmaIPs() []string {
-	domains := []string{
-		"figma.com",
-		"www.figma.com",
-		"static.figma.com",
-		"api.figma.com",
-	}
-
-	var allIPs []string
-	seen := make(map[string]bool)
-	for _, domain := range domains {
-		addrs, err := net.DefaultResolver.LookupHost(ctx, domain)
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			if !seen[addr] {
-				allIPs = append(allIPs, addr)
-				seen[addr] = true
-			}
-		}
-	}
-	return allIPs
-}
-
 // isFigmaDomain 判断是否 Figma 域名
 func isFigmaDomain(domain string) bool {
 	domain = strings.TrimSuffix(domain, ".")
@@ -201,13 +199,19 @@ func isFigmaDomain(domain string) bool {
 }
 
 // getFigmaRoot 获取 Figma 域名对应的根 Key
+// 必须按域名长度降序匹配，否则 makeproxy-c.figma.site 会被错误归到 figma.site
+// （两者 IP 池不同，混在一起会污染路由表）
 func getFigmaRoot(domain string) string {
 	domain = strings.TrimSuffix(domain, ".")
 	lower := strings.ToLower(domain)
+
+	var bestMatch string
 	for _, fd := range FigmaDomains {
 		if lower == fd.Domain || strings.HasSuffix(lower, "."+fd.Domain) {
-			return fd.Domain
+			if len(fd.Domain) > len(bestMatch) {
+				bestMatch = fd.Domain
+			}
 		}
 	}
-	return ""
+	return bestMatch
 }

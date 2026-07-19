@@ -1,6 +1,6 @@
 module figadns
 
-go 1.26.3
+go 1.24.0
 
 require github.com/miekg/dns v1.1.72
 

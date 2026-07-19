@@ -15,8 +15,8 @@ type Metrics struct {
 	Throughput   float64       // 吞吐量 Mbps
 	PacketLoss   float64       // 丢包率 0.0~1.0
 	LastChecked  time.Time     // 上次检测时间
-	SuccessCount int           // 连续成功次数
-	FailCount    int           // 连续失败次数
+	SuccessCount int           // 累计成功次数（探测成功 +1）
+	FailCount    int           // 累计失败次数（ReportFailure +1，Update 成功时 ×0.7 衰减）
 }
 
 // IP 节点
@@ -25,7 +25,6 @@ type IPNode struct {
 	Domain  string // 对应的 Figma 域名
 	Metrics *Metrics
 	Score   float64 // 综合评分，越高越好
-	index   int     // heap 索引
 }
 
 // 评分权重配置
@@ -102,15 +101,38 @@ func (rt *RouteTable) Update(domain, ip string, m Metrics) {
 		return
 	}
 
+	// 探测成功时：
+	//   - 累积 SuccessCount（用于 lossRate 计算）
+	//   - 衰减 FailCount（每次成功 ×0.7），避免历史失败永久拉高 lossRate
+	//     衰减后 FailCount 仍保留小数，calculateScore 用 int 转换取整
+	if node.Metrics != nil {
+		decayedFail := float64(node.Metrics.FailCount) * 0.7
+		m.FailCount = int(decayedFail + 0.5) // 四舍五入
+		m.SuccessCount = node.Metrics.SuccessCount + 1
+	} else {
+		m.SuccessCount = 1
+	}
+
 	// 更新指标
 	node.Metrics = &m
 
-	// 计算综合评分
+	// 计算综合评分（含失败惩罚）
 	node.Score = rt.calculateScore(m)
 
-	// 更新最优
+	// 更新最优：若被更新的是当前最优且分数下降，重新选举
 	current, hasBest := rt.best[domain]
-	if !hasBest || node.Score > current.Score {
+	if !hasBest {
+		rt.best[domain] = node
+		return
+	}
+	if node.IP == current.IP {
+		// 当前最优节点自身分数变化，重新比较
+		if node.Score < current.Score {
+			rt.triggerFailover(domain)
+		}
+		return
+	}
+	if node.Score > current.Score {
 		rt.best[domain] = node
 	}
 }
@@ -141,6 +163,10 @@ func (rt *RouteTable) calculateScore(m Metrics) float64 {
 		throughputScore*rt.weights.ThroughputWeight +
 		lossScore*rt.weights.LossWeight +
 		freshScore*rt.weights.FreshnessWeight
+
+	// 失败惩罚：每次失败扣 10 分（上限 50），持久化在 FailCount 中
+	failPenalty := math.Min(50.0, float64(m.FailCount)*10.0)
+	score -= failPenalty
 
 	return math.Max(0, math.Min(100, score))
 }
@@ -188,31 +214,17 @@ func (rt *RouteTable) ReportFailure(domain, ip string) {
 
 	node.Metrics.FailCount++
 	node.Metrics.SuccessCount = 0
-	node.Score -= 15 // 每次失败扣分
+	// 重新计算评分（calculateScore 已含 FailCount 惩罚，持久化生效）
+	node.Score = rt.calculateScore(*node.Metrics)
 
 	if node.Metrics.FailCount >= MaxFailBeforeBan {
 		rt.banned[ip] = time.Now().Add(BanDuration)
 	}
 
-	// 如果当前最优就是这个，触发切换
-	if best, ok := rt.best[domain]; ok && best.IP == ip {
+	// 连续失败达到 FailOverThreshold 且当前最优就是这个，触发切换
+	if best, ok := rt.best[domain]; ok && best.IP == ip && node.Metrics.FailCount >= FailOverThreshold {
 		rt.triggerFailover(domain)
 	}
-}
-
-// ReportSuccess 报告成功
-func (rt *RouteTable) ReportSuccess(domain, ip string) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-
-	key := domain + ":" + ip
-	node, exists := rt.nodes[key]
-	if !exists {
-		return
-	}
-
-	node.Metrics.SuccessCount++
-	node.Metrics.FailCount = 0
 }
 
 // triggerFailover 触发切换：找到次优 IP 提升为最优
@@ -281,28 +293,4 @@ func (rt *RouteTable) GetDomains() []string {
 		}
 	}
 	return domains
-}
-
-// heap 实现（备用，当前用线性扫描）
-type IPHeap []*IPNode
-
-func (h IPHeap) Len() int           { return len(h) }
-func (h IPHeap) Less(i, j int) bool { return h[i].Score > h[j].Score }
-func (h IPHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].index = i
-	h[j].index = j
-}
-func (h *IPHeap) Push(x any) {
-	n := x.(*IPNode)
-	n.index = len(*h)
-	*h = append(*h, n)
-}
-func (h *IPHeap) Pop() any {
-	old := *h
-	n := old[len(old)-1]
-	old[len(old)-1] = nil
-	n.index = -1
-	*h = old[:len(old)-1]
-	return n
 }

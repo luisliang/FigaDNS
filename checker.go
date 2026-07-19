@@ -3,37 +3,37 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
 
 // Checker 健康检测器
 type Checker struct {
-	route   *RouteTable
-	disc    *IPDiscoverer
-	mu      sync.Mutex
-	stopCh  chan struct{}
-	running bool
-	// 配置
-	passiveOnly bool // 仅被动检测（不主动发包）
+	route          *RouteTable
+	disc           *IPDiscoverer
+	mu             sync.Mutex
+	stopCh         chan struct{}
+	running        bool
 	activeInterval time.Duration
-	tcpTimeout    time.Duration
-	tlsTimeout    time.Duration
-	downloadTest  bool
+	tcpTimeout     time.Duration
+	tlsTimeout     time.Duration
+	httpTimeout   time.Duration
 }
 
 func NewChecker(route *RouteTable, disc *IPDiscoverer) *Checker {
 	return &Checker{
-		route:         route,
-		disc:          disc,
-		stopCh:        make(chan struct{}),
+		route:          route,
+		disc:           disc,
+		stopCh:         make(chan struct{}),
 		activeInterval: ProbeInterval,
-		tcpTimeout:    3 * time.Second,
-		tlsTimeout:    5 * time.Second,
-		passiveOnly:   false, // 默认开启主动探针（但低频）
+		tcpTimeout:     3 * time.Second,
+		tlsTimeout:     5 * time.Second,
+		httpTimeout:    5 * time.Second,
 	}
 }
 
@@ -44,6 +44,7 @@ func (c *Checker) Start() {
 		c.mu.Unlock()
 		return
 	}
+	c.stopCh = make(chan struct{}) // 重建 stopCh，避免复用已关闭的 channel
 	c.running = true
 	c.mu.Unlock()
 
@@ -129,77 +130,67 @@ func (c *Checker) probeIP(node *IPNode) {
 		return
 	}
 
-	// 2. TLS 握手检测
+	// 2. TLS 握手检测（失败则视为节点不可用，不能仅靠估算）
+	//    启用证书验证：ServerName 已设置，证书不匹配/链断裂会自动失败，
+	//    防止 DNS 劫持场景下被误判为可用
 	tlsLatency, err := measureTLSLatency(node.IP+":443", node.Domain, c.tlsTimeout)
 	if err != nil {
-		tlsLatency = tcpLatency * 2 // 估算
+		c.route.ReportFailure(node.Domain, node.IP)
+		return
 	}
 
-	// 3. 吞吐量检测（选做，对少量 IP 执行以免费流量）
-	var throughput float64 = 5.0 // 默认估值
-	if c.downloadTest {
-		throughput = measureThroughput(node.IP+":443", 3*time.Second)
+	// 3. HTTPS 层探测：TCP/TLS 通不等于服务可用，可能被 WAF 拦截（403）或节点故障（502）
+	//    发 HEAD 请求验证 HTTP 层，5xx 或连接失败视为节点不可用
+	httpLatency, httpStatus, err := c.measureHTTP(node.IP, node.Domain, c.httpTimeout)
+	if err != nil {
+		c.route.ReportFailure(node.Domain, node.IP)
+		return
 	}
+	if httpStatus >= 500 {
+		c.route.ReportFailure(node.Domain, node.IP)
+		return
+	}
+	// 4xx（如 401/403/404）属正常业务响应，节点可用
+	_ = httpLatency
 
-	// 丢包率估算（基于连接成功率）
+	// 吞吐量：默认给满分估值（20Mbps）
+	// 旧的 measureThroughput 裸 TCP 读不到 HTTPS 数据恒返回 0.1，已删除
+	throughput := 20.0
+
+	// 丢包率：基于 SuccessCount/FailCount 比例（FailCount 由 ReportFailure 累积，
+	// 在 Update 成功时按 0.7 衰减，避免历史失败永久拉高 lossRate）
 	lossRate := 0.0
 	if node.Metrics != nil {
 		total := node.Metrics.SuccessCount + node.Metrics.FailCount + 1
-		lossRate = float64(node.Metrics.FailCount) / float64(total)
-		if lossRate > 0.3 {
-			lossRate = 0.3
+		if total > 0 {
+			lossRate = float64(node.Metrics.FailCount) / float64(total)
+			if lossRate > 0.3 {
+				lossRate = 0.3
+			}
 		}
 	}
 
 	metrics := Metrics{
-		TCPLatency:   tcpLatency,
-		TLSLatency:   tlsLatency,
-		Throughput:   throughput,
-		PacketLoss:   lossRate,
-		LastChecked:  time.Now(),
-		SuccessCount: 1,
-		FailCount:    0,
+		TCPLatency:  tcpLatency,
+		TLSLatency:  tlsLatency,
+		Throughput:  throughput,
+		PacketLoss:  lossRate,
+		LastChecked: time.Now(),
 	}
 
+	// Update 内部会累积 SuccessCount、衰减 FailCount
 	c.route.Update(node.Domain, node.IP, metrics)
-	c.route.ReportSuccess(node.Domain, node.IP)
-
-	// 检查是否低于拥堵阈值，触发通知
-	if node.Score < CongestionScoreThreshold {
-		// 会在 printStatus 中统一报告
-	}
-}
-
-// 被动检测：当有真实的 Figma 流量经过 DNS 时，记录延迟
-// 由 dns.go 在转发 DNS 请求时回调
-func (c *Checker) ReportPassiveLatency(domain, ip string, latency time.Duration) {
-	c.route.mu.Lock()
-	defer c.route.mu.Unlock()
-
-	key := domain + ":" + ip
-	node, exists := c.route.nodes[key]
-	if !exists {
-		return
-	}
-
-	// 指数移动平均，平滑延迟数据
-	alpha := 0.3
-	measured := latency.Seconds() * 1000
-	if node.Metrics.TCPLatency == 0 {
-		node.Metrics.TCPLatency = latency
-	} else {
-		ema := alpha*measured + (1-alpha)*node.Metrics.TCPLatency.Seconds()*1000
-		node.Metrics.TCPLatency = time.Duration(ema) * time.Millisecond
-	}
-	node.Metrics.LastChecked = time.Now()
-	node.Metrics.SuccessCount++
-	node.Metrics.FailCount = 0
 }
 
 // 打印当前路由状态
 func (c *Checker) printStatus() {
 	for _, fd := range FigmaDomains {
 		bestIP, bestScore := c.route.GetBest(fd.Domain)
+		// 无候选 IP（域名未启用 / DNS 未发现）—— 不应显示"拥堵"
+		if bestIP == "" {
+			fmt.Printf("[FigaDNS] %-18s → (未发现候选 IP) %s\n", fd.Label, fd.Domain)
+			continue
+		}
 		desc := "正常"
 		if bestScore < CongestionScoreThreshold {
 			desc = "⚠ 拥堵"
@@ -227,54 +218,57 @@ func measureTCPLatency(address string, timeout time.Duration) (time.Duration, er
 }
 
 // measureTLSLatency 测量 TLS 握手耗时
+// 不再 InsecureSkipVerify：ServerName 已设置，证书链验证生效
+// 防止 DNS 劫持场景下被劫持 IP 用任意证书通过探测
 func measureTLSLatency(address, serverName string, timeout time.Duration) (time.Duration, error) {
 	dialer := &net.Dialer{Timeout: timeout}
 	start := time.Now()
 	conn, err := tls.DialWithDialer(dialer, "tcp", address, &tls.Config{
-		ServerName:         serverName,
-		InsecureSkipVerify: true,
+		ServerName: serverName,
 	})
 	if err != nil {
 		return 0, err
 	}
 	defer conn.Close()
-	return time.Since(start) - 0, nil // TLS Dial 包含 TCP 连接时间
+	return time.Since(start), nil // TLS Dial 包含 TCP 连接时间
 }
 
-// measureThroughput 测量吞吐量（下载一个小文件）
-func measureThroughput(address string, timeout time.Duration) float64 {
-	// 简化实现：基于 TCP 延迟估算吞吐量
-	// 实际可下载一个已知大小的资源
-	conn, err := net.DialTimeout("tcp", address, timeout)
-	if err != nil {
-		return 0.5 // 保守估计
+// measureHTTP 发送 HTTPS HEAD 请求验证 HTTP 层可用性
+// 返回（延迟, HTTP 状态码, error）
+// 用途：检测 WAF 拦截（403）、节点故障（502/503）等 TCP/TLS 握手无法发现的问题
+//
+// 指定 IP 直连：通过自定义 Transport 的 DialContext 强制连接到 node.IP，
+// 同时 TLS ServerName 用 domain 保证证书验证通过
+func (c *Checker) measureHTTP(ip, domain string, timeout time.Duration) (time.Duration, int, error) {
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{Timeout: timeout}).DialContext,
+		// 关键：强制连接到指定 IP，而不是 DNS 解析的结果
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// addr 形如 "domain:443"，替换为 "ip:443"
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			dialer := &net.Dialer{Timeout: timeout}
+			return tls.DialWithDialer(dialer, network, net.JoinHostPort(ip, port), &tls.Config{
+				ServerName: domain,
+			})
+		},
 	}
-	defer conn.Close()
-
-	// 粗略估算：延迟越低，吞吐量越高
-	// RTT < 50ms → ~20Mbps, RTT > 500ms → ~1Mbps
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		// 不跟随重定向：3xx 也算节点可用
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	url := "https://" + domain + "/"
 	start := time.Now()
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-	buf := make([]byte, 1460)
-	totalBytes := 0
-	for {
-		n, err := conn.Read(buf)
-		totalBytes += n
-		if err != nil {
-			break
-		}
-		if time.Since(start) > timeout {
-			break
-		}
+	resp, err := client.Head(url)
+	if err != nil {
+		return 0, 0, err
 	}
-	elapsed := time.Since(start)
-	if elapsed < 100*time.Millisecond {
-		elapsed = 100 * time.Millisecond
-	}
-	mbps := float64(totalBytes*8) / elapsed.Seconds() / 1_000_000
-	if mbps < 0.1 {
-		mbps = 0.1
-	}
-	return mbps
+	defer resp.Body.Close()
+	return time.Since(start), resp.StatusCode, nil
 }

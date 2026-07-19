@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -26,8 +28,7 @@ func main() {
 		case "stop":
 			cmdStop()
 		case "restart":
-			cmdStop()
-			cmdStart()
+			cmdRestart()
 		case "status":
 			cmdStatus()
 		case "setup":
@@ -113,47 +114,101 @@ func cmdStart() {
 	fmt.Println("\n正在停止...")
 }
 
+const launchdLabel = "com.figadns.daemon"
+
 func cmdStop() {
-	fmt.Println("停止 FigaDNS...")
+	fmt.Println("停止 FigaDNS 服务...")
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("获取用户目录失败: %v\n", err)
+		return
+	}
+	plistFile := home + "/Library/LaunchAgents/com.figadns.daemon.plist"
+
+	// launchctl stop 对 KeepAlive 服务只是发 SIGTERM，launchd 会立即重启。
+	// 必须用 bootout/unload 才能真正移除服务。
+	cmd := exec.Command("launchctl", "bootout", "gui/"+fmt.Sprintf("%d", os.Getuid())+"/"+launchdLabel)
+	if err := cmd.Run(); err != nil {
+		cmd = exec.Command("launchctl", "unload", plistFile)
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("停止失败: %v\n", err)
+			fmt.Println("提示: 服务可能未安装或未运行")
+			return
+		}
+	}
 	fmt.Println("已停止")
+}
+
+func cmdRestart() {
+	fmt.Println("重启 FigaDNS 服务...")
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("获取用户目录失败: %v\n", err)
+		return
+	}
+	plistFile := home + "/Library/LaunchAgents/com.figadns.daemon.plist"
+
+	stopCmd := exec.Command("launchctl", "bootout", "gui/"+fmt.Sprintf("%d", os.Getuid())+"/"+launchdLabel)
+	if err := stopCmd.Run(); err != nil {
+		stopCmd = exec.Command("launchctl", "unload", plistFile)
+		stopCmd.Run() // 服务可能本就没运行，忽略
+	}
+
+	loadCmd := exec.Command("launchctl", "load", plistFile)
+	if err := loadCmd.Run(); err != nil {
+		fmt.Printf("重启失败: %v\n", err)
+		fmt.Println("提示: 请先运行 `figadns setup` 安装服务")
+		return
+	}
+	fmt.Println("已重启")
 }
 
 func cmdStatus() {
 	fmt.Printf("FigaDNS v%s\n", version)
-	fmt.Println("状态: 未运行 (正在开发中)")
+	cmd := exec.Command("launchctl", "list", launchdLabel)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Println("状态: 服务未安装或未运行")
+		fmt.Println("提示: 运行 `figadns setup` 或双击 setup.command 安装服务")
+		return
+	}
+	// launchctl list 输出包含 PID（第二列），0 表示未运行
+	fmt.Println("状态: 服务已安装")
+	fmt.Println(string(output))
 }
 
 func cmdSetup() {
-	fmt.Println("正在配置 macOS 网络...")
+	fmt.Println("FigaDNS 配置说明")
 	fmt.Println()
-
-	resolverDir := "/etc/resolver"
-
-	for _, fd := range FigmaDomains {
-		domain := fd.Domain
-		configPath := resolverDir + "/" + domain
-
-		fmt.Printf("需要创建 %s\n", configPath)
-		fmt.Printf("  内容: nameserver 127.0.0.1 (port %d)\n", Config.Port)
-	}
-
+	fmt.Println("setup 命令仅为打印配置说明，实际安装请执行：")
+	fmt.Println("  sudo ./setup.sh")
+	fmt.Println("  或双击 FigaDNS.app/Contents/Resources/setup.command")
 	fmt.Println()
-	fmt.Println("请运行以下命令完成配置:")
-	fmt.Printf("  sudo mkdir -p /etc/resolver\n")
-	for _, fd := range FigmaDomains {
-		fmt.Printf("  sudo bash -c 'echo \"nameserver 127.0.0.1\nport %d\" > /etc/resolver/%s'\n",
-			Config.Port, fd.Domain)
-	}
-	fmt.Println()
-	fmt.Println("配置后,只有 *.figma.com 的 DNS 会经过 FigaDNS")
-	fmt.Println("其他所有域名不受影响")
+	fmt.Println("该脚本会：")
+	fmt.Println("  ① 在 /etc/resolver/ 配置本地 DNS（*.figma.com / *.figma.site 走 FigaDNS）")
+	fmt.Printf("    nameserver 127.0.0.1\n    port %d\n    timeout 5\n", Config.Port)
+	fmt.Println("  ② 安装 LaunchAgent（~/Library/LaunchAgents/com.figadns.daemon.plist）")
+	fmt.Println("  ③ 启动后台服务（开机自启）")
 }
 
 func cmdUninstall() {
 	fmt.Println("移除 FigaDNS 网络配置...")
 	fmt.Println()
 	fmt.Println("请运行以下命令:")
+	// 收集所有 root domain（去重，避免 makeproxy-c.figma.site / makeproxy-m.figma.site
+	// 重复输出，且它们由 figma.site resolver 覆盖）
+	seen := make(map[string]bool)
 	for _, fd := range FigmaDomains {
+		if seen[fd.Domain] {
+			continue
+		}
+		seen[fd.Domain] = true
+		// makeproxy-*.figma.site 由 /etc/resolver/figma.site 覆盖，不需要单独的 resolver 文件
+		if strings.HasSuffix(fd.Domain, ".figma.site") && fd.Domain != "figma.site" {
+			continue
+		}
 		fmt.Printf("  sudo rm /etc/resolver/%s\n", fd.Domain)
 	}
 }
